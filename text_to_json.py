@@ -1,4 +1,3 @@
-```python
 import json
 from pathlib import Path
 
@@ -239,4 +238,3 @@ def batch_convert():
 if __name__ == "__main__":
 
     batch_convert()
-```
