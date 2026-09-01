@@ -1,0 +1,6 @@
+{
+    "caseId": "CASE-001",
+    "source": "frontend",
+    "someExistingField": "existing value",
+    "chatqna": "Hello, I am Dr John Smith. My phone number is 9876543210 and email is john@example.com. I am calling regarding the patient Mary. Mary's date of birth is 12 January 1980. Yes, you can contact me. The patient does not want to be contacted by text."
+}
