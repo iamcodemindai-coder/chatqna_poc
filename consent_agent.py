@@ -1,10 +1,12 @@
+import json
 import os
+import re
 import time
 from typing import Optional, Dict, Any
 
 from dotenv import load_dotenv
+from openai import OpenAI
 from pydantic import BaseModel, ConfigDict
-from langchain_openai import ChatOpenAI
 
 
 # ============================================================
@@ -24,8 +26,15 @@ OPENAI_BASE_URL = os.getenv(
 
 OPENAI_MODEL = os.getenv(
     "OPENAI_MODEL",
-    "gpt-5.5",
+    "",
 ).strip()
+
+OPENAI_TEMPERATURE = float(
+    os.getenv(
+        "OPENAI_TEMPERATURE",
+        "0",
+    )
+)
 
 
 if not OPENAI_API_KEY:
@@ -35,25 +44,29 @@ if not OPENAI_API_KEY:
     )
 
 
+if not OPENAI_BASE_URL:
+
+    raise ValueError(
+        "OPENAI_BASE_URL is missing."
+    )
+
+
+if not OPENAI_MODEL:
+
+    raise ValueError(
+        "OPENAI_MODEL is missing."
+    )
+
+
 # ============================================================
-# LLM
+# OPENAI-COMPATIBLE CLIENT
+#
+# Databricks Model Serving endpoint.
 # ============================================================
 
-llm_kwargs = {
-    "model": OPENAI_MODEL,
-    "api_key": OPENAI_API_KEY,
-    "temperature": 0,
-}
-
-if OPENAI_BASE_URL:
-
-    llm_kwargs[
-        "base_url"
-    ] = OPENAI_BASE_URL
-
-
-llm = ChatOpenAI(
-    **llm_kwargs
+client = OpenAI(
+    api_key=OPENAI_API_KEY,
+    base_url=OPENAI_BASE_URL,
 )
 
 
@@ -64,7 +77,7 @@ llm = ChatOpenAI(
 class ConsentExtraction(BaseModel):
 
     model_config = ConfigDict(
-        extra="forbid"
+        extra="ignore"
     )
 
     permission_to_contact_hcp: Optional[
@@ -86,15 +99,6 @@ class ConsentExtraction(BaseModel):
     permission_to_contact_via_text: Optional[
         bool
     ] = None
-
-
-# ============================================================
-# STRUCTURED LLM
-# ============================================================
-
-consent_llm = llm.with_structured_output(
-    ConsentExtraction
-)
 
 
 # ============================================================
@@ -199,8 +203,225 @@ IMPORTANT RULES
 
 8. Do not extract contact information.
 
-9. Return ONLY the five permission values.
+9. Return ONLY valid JSON.
+
+10. Do not return Markdown.
+
+11. Do not return ```json.
+
+12. Do not return explanations.
+
+============================================================
+OUTPUT FORMAT
+============================================================
+
+Return exactly this structure:
+
+{
+    "permission_to_contact_hcp": null,
+    "permission_to_contact_reporter": null,
+    "permission_to_contact_patient": null,
+    "permission_to_contact_complaint": null,
+    "permission_to_contact_via_text": null
+}
+
 """
+
+
+# ============================================================
+# CLEAN MODEL JSON
+# ============================================================
+
+def extract_json_from_response(
+    content: Any
+) -> Dict[str, Any]:
+    """
+    Converts different possible model response formats
+    into a Python dictionary.
+
+    Supports:
+        string
+        list of content blocks
+        dictionary
+        markdown fenced JSON
+    """
+
+    # --------------------------------------------------------
+    # STRING
+    # --------------------------------------------------------
+
+    if isinstance(
+        content,
+        str
+    ):
+
+        text = content.strip()
+
+    # --------------------------------------------------------
+    # LIST
+    # --------------------------------------------------------
+
+    elif isinstance(
+        content,
+        list
+    ):
+
+        parts = []
+
+        for item in content:
+
+            if isinstance(
+                item,
+                str
+            ):
+
+                parts.append(
+                    item
+                )
+
+            elif isinstance(
+                item,
+                dict
+            ):
+
+                if item.get(
+                    "type"
+                ) == "text":
+
+                    parts.append(
+                        str(
+                            item.get(
+                                "text",
+                                ""
+                            )
+                        )
+                    )
+
+                elif "text" in item:
+
+                    parts.append(
+                        str(
+                            item[
+                                "text"
+                            ]
+                        )
+                    )
+
+        text = "".join(
+            parts
+        ).strip()
+
+    # --------------------------------------------------------
+    # DICTIONARY
+    # --------------------------------------------------------
+
+    elif isinstance(
+        content,
+        dict
+    ):
+
+        return content
+
+    else:
+
+        raise ValueError(
+            "Unsupported LLM response format."
+        )
+
+    # --------------------------------------------------------
+    # REMOVE MARKDOWN FENCE
+    # --------------------------------------------------------
+
+    text = re.sub(
+        r"^```json\s*",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+
+    text = re.sub(
+        r"^```\s*",
+        "",
+        text,
+    )
+
+    text = re.sub(
+        r"\s*```$",
+        "",
+        text,
+    )
+
+    text = text.strip()
+
+    # --------------------------------------------------------
+    # DIRECT JSON
+    # --------------------------------------------------------
+
+    try:
+
+        parsed = json.loads(
+            text
+        )
+
+        if not isinstance(
+            parsed,
+            dict
+        ):
+
+            raise ValueError(
+                "LLM JSON response is not an object."
+            )
+
+        return parsed
+
+    except json.JSONDecodeError:
+
+        pass
+
+    # --------------------------------------------------------
+    # TRY TO FIND JSON OBJECT
+    # --------------------------------------------------------
+
+    start = text.find(
+        "{"
+    )
+
+    end = text.rfind(
+        "}"
+    )
+
+    if start == -1 or end == -1:
+
+        raise ValueError(
+            "LLM did not return valid JSON."
+        )
+
+    json_text = text[
+        start:end + 1
+    ]
+
+    try:
+
+        parsed = json.loads(
+            json_text
+        )
+
+    except json.JSONDecodeError as exc:
+
+        raise ValueError(
+            "LLM returned invalid JSON."
+        ) from exc
+
+    if not isinstance(
+        parsed,
+        dict
+    ):
+
+        raise ValueError(
+            "LLM JSON response is not an object."
+        )
+
+    return parsed
 
 
 # ============================================================
@@ -216,7 +437,25 @@ def consent_agent(
         ""
     )
 
+    # --------------------------------------------------------
+    # EMPTY CHATQNA
+    #
+    # IMPORTANT:
+    # No LLM call.
+    # --------------------------------------------------------
+
+    if not isinstance(
+        chatqna,
+        str
+    ):
+
+        chatqna = ""
+
     if not chatqna.strip():
+
+        print(
+            "\n[CONSENT AGENT] Skipped - empty chatqna."
+        )
 
         return {
             "consent_result": {
@@ -239,15 +478,28 @@ def consent_agent(
 
     try:
 
-        result = consent_llm.invoke(
-            [
-                (
-                    "system",
-                    CONSENT_SYSTEM_PROMPT,
-                ),
-                (
-                    "user",
-                    f"""
+        # ----------------------------------------------------
+        # CHAT COMPLETION
+        #
+        # No with_structured_output().
+        # ----------------------------------------------------
+
+        response = client.chat.completions.create(
+
+            model=OPENAI_MODEL,
+
+            temperature=OPENAI_TEMPERATURE,
+
+            messages=[
+                {
+                    "role": "system",
+                    "content":
+                        CONSENT_SYSTEM_PROMPT,
+                },
+                {
+                    "role": "user",
+                    "content":
+                        f"""
 Extract ONLY consent information from
 the following chatqna.
 
@@ -257,15 +509,63 @@ CHATQNA
 {chatqna}
 
 ========
+
+Return ONLY valid JSON.
 """,
-                ),
-            ]
+                },
+            ],
         )
+
+        # ----------------------------------------------------
+        # TIME
+        # ----------------------------------------------------
 
         elapsed = (
             time.perf_counter()
             - start_time
         )
+
+        # ----------------------------------------------------
+        # GET MODEL CONTENT
+        # ----------------------------------------------------
+
+        if not response.choices:
+
+            raise ValueError(
+                "LLM returned no choices."
+            )
+
+        message = (
+            response.choices[0].message
+        )
+
+        content = message.content
+
+        if not content:
+
+            raise ValueError(
+                "LLM returned empty content."
+            )
+
+        # ----------------------------------------------------
+        # PARSE JSON
+        # ----------------------------------------------------
+
+        raw_data = extract_json_from_response(
+            content
+        )
+
+        # ----------------------------------------------------
+        # PYDANTIC VALIDATION
+        # ----------------------------------------------------
+
+        result = ConsentExtraction.model_validate(
+            raw_data
+        )
+
+        # ----------------------------------------------------
+        # BUILD PERMISSIONS
+        # ----------------------------------------------------
 
         permissions = {
 
@@ -284,6 +584,10 @@ CHATQNA
             "Permission To Contact Via Text":
                 result.permission_to_contact_via_text,
         }
+
+        # ----------------------------------------------------
+        # LOG
+        # ----------------------------------------------------
 
         print(
             "[CONSENT AGENT] Completed."
@@ -323,17 +627,11 @@ CHATQNA
         ) from exc
 
 
-
-
-
-
 # ============================================================
 # STANDALONE TEST RUNNER
 # ============================================================
 
 if __name__ == "__main__":
-
-    import json
 
     print("=" * 70)
     print("CONSENT AGENT - STANDALONE TEST")
@@ -347,7 +645,9 @@ if __name__ == "__main__":
             encoding="utf-8",
         ) as file:
 
-            input_data = json.load(file)
+            input_data = json.load(
+                file
+            )
 
         chatqna = input_data.get(
             "chatqna",
@@ -360,7 +660,10 @@ if __name__ == "__main__":
             }
         )
 
-        print("\nCONSENT AGENT OUTPUT:")
+        print(
+            "\nCONSENT AGENT OUTPUT:"
+        )
+
         print(
             json.dumps(
                 result,
@@ -368,6 +671,10 @@ if __name__ == "__main__":
                 ensure_ascii=False,
             )
         )
+
+        # ----------------------------------------------------
+        # SAVE STANDALONE OUTPUT
+        # ----------------------------------------------------
 
         with open(
             "consent_output.json",
