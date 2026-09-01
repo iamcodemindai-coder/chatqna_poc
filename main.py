@@ -12,7 +12,6 @@ from agents.supervisor_agent.agent import (
 )
 
 from agents.contact_agent.agent import contact_agent
-
 from agents.consent_agent.agent import consent_agent
 
 
@@ -46,6 +45,36 @@ class GraphState(TypedDict, total=False):
 
 
 # ============================================================
+# AGENT DISPATCHER
+# ============================================================
+
+def dispatch_agents(
+    state: GraphState
+) -> Dict[str, Any]:
+    """
+    Dispatcher node.
+
+    This node does NOT call any LLM.
+
+    Its only purpose is to fan out the same chatqna
+    to independent agents.
+
+    Current agents:
+        - Contact Agent
+        - Consent Agent
+
+    Future agents can be connected here without changing
+    the existing agent implementations.
+    """
+
+    print("\n[SUPERVISOR] Dispatching agents...")
+
+    return {
+        "status": "AGENTS_RUNNING"
+    }
+
+
+# ============================================================
 # BUILD LANGGRAPH
 # ============================================================
 
@@ -65,6 +94,15 @@ def build_graph():
     workflow.add_node(
         "supervisor_finalize",
         supervisor_finalize,
+    )
+
+    # --------------------------------------------------------
+    # DISPATCHER
+    # --------------------------------------------------------
+
+    workflow.add_node(
+        "dispatch_agents",
+        dispatch_agents,
     )
 
     # --------------------------------------------------------
@@ -98,20 +136,38 @@ def build_graph():
         "supervisor_prepare",
         supervisor_router,
         {
-            "agents": "contact_agent",
+            "agents": "dispatch_agents",
             "empty": "supervisor_finalize",
         },
     )
 
     # --------------------------------------------------------
-    # IMPORTANT
+    # DISPATCH
     #
-    # Contact and Consent are independent.
+    # Both agents receive the same state.
     #
     # Contact does NOT communicate with Consent.
     # Consent does NOT communicate with Contact.
     #
-    # Both operate on the original chatqna.
+    # Both communicate only through the shared LangGraph state
+    # and Supervisor.
+    # --------------------------------------------------------
+
+    workflow.add_edge(
+        "dispatch_agents",
+        "contact_agent",
+    )
+
+    workflow.add_edge(
+        "dispatch_agents",
+        "consent_agent",
+    )
+
+    # --------------------------------------------------------
+    # AGENT -> SUPERVISOR
+    #
+    # LangGraph waits for both independent branches before
+    # executing supervisor_finalize.
     # --------------------------------------------------------
 
     workflow.add_edge(
@@ -143,25 +199,29 @@ def build_graph():
 def process_data(
     input_data: Dict[str, Any]
 ) -> Dict[str, Any]:
-
     """
     Reusable processing function.
 
-    Current POC:
+    POC:
 
         input.json
-            ↓
+            |
+            v
         process_data()
-            ↓
+            |
+            v
         output.json
 
-    Future production:
+    Future Production:
 
-        API JSON
-            ↓
+        Existing API JSON
+            |
+            v
         process_data(api_json)
-            ↓
-        result JSON
+            |
+            v
+        Existing JSON + ChatResponse
+        + Additional Fields
     """
 
     if not isinstance(input_data, dict):
@@ -170,9 +230,21 @@ def process_data(
             "Input must be a JSON object."
         )
 
+    # --------------------------------------------------------
+    # BUILD GRAPH
+    # --------------------------------------------------------
+
     graph = build_graph()
 
+    # --------------------------------------------------------
+    # START TIMER
+    # --------------------------------------------------------
+
     start_time = time.perf_counter()
+
+    # --------------------------------------------------------
+    # INITIAL STATE
+    # --------------------------------------------------------
 
     initial_state: GraphState = {
         "input_data": deepcopy(input_data),
@@ -181,14 +253,26 @@ def process_data(
 
     try:
 
+        # ----------------------------------------------------
+        # RUN LANGGRAPH
+        # ----------------------------------------------------
+
         result = graph.invoke(
             initial_state
         )
+
+        # ----------------------------------------------------
+        # TOTAL TIME
+        # ----------------------------------------------------
 
         total_time = (
             time.perf_counter()
             - start_time
         )
+
+        # ----------------------------------------------------
+        # GET FINAL OUTPUT
+        # ----------------------------------------------------
 
         output_data = result.get(
             "final_output"
@@ -206,12 +290,42 @@ def process_data(
 
             output_data[
                 "processing_error"
-            ] = "Final output was not generated."
+            ] = (
+                "Final output was not generated."
+            )
+
+        # ----------------------------------------------------
+        # PROCESSING TIME
+        # ----------------------------------------------------
 
         output_data[
             "processing_time_seconds"
         ] = round(
             total_time,
+            3,
+        )
+
+        # ----------------------------------------------------
+        # AGENT TIMINGS
+        # ----------------------------------------------------
+
+        output_data[
+            "contact_llm_time_seconds"
+        ] = round(
+            result.get(
+                "contact_llm_time",
+                0.0
+            ),
+            3,
+        )
+
+        output_data[
+            "consent_llm_time_seconds"
+        ] = round(
+            result.get(
+                "consent_llm_time",
+                0.0
+            ),
             3,
         )
 
@@ -231,6 +345,10 @@ def process_data(
         print(
             str(exc)
         )
+
+        # ----------------------------------------------------
+        # FAILURE OUTPUT
+        # ----------------------------------------------------
 
         output_data = deepcopy(
             input_data
@@ -274,6 +392,14 @@ def process_data(
             total_time,
             3,
         )
+
+        output_data[
+            "contact_llm_time_seconds"
+        ] = 0.0
+
+        output_data[
+            "consent_llm_time_seconds"
+        ] = 0.0
 
         return output_data
 
