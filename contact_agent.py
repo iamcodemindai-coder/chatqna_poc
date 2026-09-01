@@ -1,10 +1,12 @@
+import json
 import os
+import re
 import time
 from typing import List, Optional, Dict, Any
 
 from dotenv import load_dotenv
+from openai import OpenAI
 from pydantic import BaseModel, Field, ConfigDict
-from langchain_openai import ChatOpenAI
 
 
 # ============================================================
@@ -24,8 +26,15 @@ OPENAI_BASE_URL = os.getenv(
 
 OPENAI_MODEL = os.getenv(
     "OPENAI_MODEL",
-    "gpt-5.5",
+    "",
 ).strip()
+
+OPENAI_TEMPERATURE = float(
+    os.getenv(
+        "OPENAI_TEMPERATURE",
+        "0",
+    )
+)
 
 
 if not OPENAI_API_KEY:
@@ -35,25 +44,30 @@ if not OPENAI_API_KEY:
     )
 
 
+if not OPENAI_BASE_URL:
+
+    raise ValueError(
+        "OPENAI_BASE_URL is missing."
+    )
+
+
+if not OPENAI_MODEL:
+
+    raise ValueError(
+        "OPENAI_MODEL is missing."
+    )
+
+
 # ============================================================
-# LLM
+# OPENAI-COMPATIBLE CLIENT
+#
+# Databricks Model Serving exposes an OpenAI-compatible
+# Chat Completions interface.
 # ============================================================
 
-llm_kwargs = {
-    "model": OPENAI_MODEL,
-    "api_key": OPENAI_API_KEY,
-    "temperature": 0,
-}
-
-if OPENAI_BASE_URL:
-
-    llm_kwargs[
-        "base_url"
-    ] = OPENAI_BASE_URL
-
-
-llm = ChatOpenAI(
-    **llm_kwargs
+client = OpenAI(
+    api_key=OPENAI_API_KEY,
+    base_url=OPENAI_BASE_URL,
 )
 
 
@@ -64,7 +78,7 @@ llm = ChatOpenAI(
 class ContactPerson(BaseModel):
 
     model_config = ConfigDict(
-        extra="forbid"
+        extra="ignore"
     )
 
     Type: str = Field(
@@ -74,6 +88,7 @@ class ContactPerson(BaseModel):
     )
 
     FirstName: Optional[str] = None
+
     LastName: Optional[str] = None
 
     PhoneNumber: Optional[str] = None
@@ -102,7 +117,7 @@ class ContactPerson(BaseModel):
 class ContactExtraction(BaseModel):
 
     model_config = ConfigDict(
-        extra="forbid"
+        extra="ignore"
     )
 
     contacts: List[
@@ -110,15 +125,6 @@ class ContactExtraction(BaseModel):
     ] = Field(
         default_factory=list
     )
-
-
-# ============================================================
-# STRUCTURED LLM
-# ============================================================
-
-contact_llm = llm.with_structured_output(
-    ContactExtraction
-)
 
 
 # ============================================================
@@ -194,7 +200,7 @@ The chatqna can contain:
 - mixed languages
 - conversational filler
 
-You must understand the meaningful semantic content.
+Understand the meaningful semantic content.
 
 Ignore irrelevant noise.
 
@@ -273,12 +279,52 @@ IMPORTANT RULES
 
 15. Maximum one HCP and one Patient.
 
-16. Return ONLY contact extraction.
+16. Return ONLY valid JSON.
+
+17. Do not return Markdown.
+
+18. Do not return ```json.
+
+19. Do not return explanations.
+
+============================================================
+OUTPUT FORMAT
+============================================================
+
+Return exactly this structure:
+
+{
+    "contacts": [
+        {
+            "Type": "HCP",
+            "FirstName": null,
+            "LastName": null,
+            "PhoneNumber": null,
+            "AdditionalPhoneNumber": null,
+            "EmailAddress": null,
+            "DateOfBirth": null,
+            "Gender": null,
+            "Address": null,
+            "Street": null,
+            "City": null,
+            "ZipPostalCode": null,
+            "StateProvince": null,
+            "Country": null
+        }
+    ]
+}
+
+If there are no contacts:
+
+{
+    "contacts": []
+}
+
 """
 
 
 # ============================================================
-# NORMALIZE CONTACT
+# CONTACT FIELDS
 # ============================================================
 
 CONTACT_FIELDS = [
@@ -298,6 +344,206 @@ CONTACT_FIELDS = [
 ]
 
 
+# ============================================================
+# CLEAN MODEL JSON
+# ============================================================
+
+def extract_json_from_response(
+    content: Any
+) -> Dict[str, Any]:
+    """
+    Converts different possible model response formats
+    into a Python dictionary.
+
+    Supports:
+        string
+        list of content blocks
+        dictionary
+        markdown fenced JSON
+    """
+
+    # --------------------------------------------------------
+    # STRING
+    # --------------------------------------------------------
+
+    if isinstance(
+        content,
+        str
+    ):
+
+        text = content.strip()
+
+    # --------------------------------------------------------
+    # LIST
+    # --------------------------------------------------------
+
+    elif isinstance(
+        content,
+        list
+    ):
+
+        parts = []
+
+        for item in content:
+
+            if isinstance(
+                item,
+                str
+            ):
+
+                parts.append(
+                    item
+                )
+
+            elif isinstance(
+                item,
+                dict
+            ):
+
+                if item.get(
+                    "type"
+                ) == "text":
+
+                    parts.append(
+                        str(
+                            item.get(
+                                "text",
+                                ""
+                            )
+                        )
+                    )
+
+                elif "text" in item:
+
+                    parts.append(
+                        str(
+                            item[
+                                "text"
+                            ]
+                        )
+                    )
+
+        text = "".join(
+            parts
+        ).strip()
+
+    # --------------------------------------------------------
+    # DICTIONARY
+    # --------------------------------------------------------
+
+    elif isinstance(
+        content,
+        dict
+    ):
+
+        return content
+
+    else:
+
+        raise ValueError(
+            "Unsupported LLM response format."
+        )
+
+    # --------------------------------------------------------
+    # REMOVE MARKDOWN FENCE
+    # --------------------------------------------------------
+
+    text = re.sub(
+        r"^```json\s*",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+
+    text = re.sub(
+        r"^```\s*",
+        "",
+        text,
+    )
+
+    text = re.sub(
+        r"\s*```$",
+        "",
+        text,
+    )
+
+    text = text.strip()
+
+    # --------------------------------------------------------
+    # DIRECT JSON
+    # --------------------------------------------------------
+
+    try:
+
+        parsed = json.loads(
+            text
+        )
+
+        if not isinstance(
+            parsed,
+            dict
+        ):
+
+            raise ValueError(
+                "LLM JSON response is not an object."
+            )
+
+        return parsed
+
+    except json.JSONDecodeError:
+
+        pass
+
+    # --------------------------------------------------------
+    # TRY TO FIND JSON OBJECT
+    # --------------------------------------------------------
+
+    start = text.find(
+        "{"
+    )
+
+    end = text.rfind(
+        "}"
+    )
+
+    if start == -1 or end == -1:
+
+        raise ValueError(
+            "LLM did not return valid JSON."
+        )
+
+    json_text = text[
+        start:end + 1
+    ]
+
+    try:
+
+        parsed = json.loads(
+            json_text
+        )
+
+    except json.JSONDecodeError as exc:
+
+        raise ValueError(
+            "LLM returned invalid JSON."
+        ) from exc
+
+    if not isinstance(
+        parsed,
+        dict
+    ):
+
+        raise ValueError(
+            "LLM JSON response is not an object."
+        )
+
+    return parsed
+
+
+# ============================================================
+# NORMALIZE CONTACT
+# ============================================================
+
 def normalize_contact(
     contact: Dict[str, Any]
 ):
@@ -308,6 +554,10 @@ def normalize_contact(
             ""
         )
     ).strip()
+
+    # --------------------------------------------------------
+    # Validate Type
+    # --------------------------------------------------------
 
     if contact_type not in [
         "HCP",
@@ -320,6 +570,10 @@ def normalize_contact(
         "Type": contact_type
     }
 
+    # --------------------------------------------------------
+    # Normalize Fields
+    # --------------------------------------------------------
+
     for field in CONTACT_FIELDS:
 
         value = contact.get(
@@ -327,6 +581,7 @@ def normalize_contact(
         )
 
         if value is None:
+
             value = ""
 
         normalized[field] = str(
@@ -349,7 +604,25 @@ def contact_agent(
         ""
     )
 
+    # --------------------------------------------------------
+    # EMPTY CHATQNA
+    #
+    # IMPORTANT:
+    # No LLM call.
+    # --------------------------------------------------------
+
+    if not isinstance(
+        chatqna,
+        str
+    ):
+
+        chatqna = ""
+
     if not chatqna.strip():
+
+        print(
+            "\n[CONTACT AGENT] Skipped - empty chatqna."
+        )
 
         return {
             "contact_result": {
@@ -366,15 +639,31 @@ def contact_agent(
 
     try:
 
-        result = contact_llm.invoke(
-            [
-                (
-                    "system",
-                    CONTACT_SYSTEM_PROMPT,
-                ),
-                (
-                    "user",
-                    f"""
+        # ----------------------------------------------------
+        # CHAT COMPLETION
+        #
+        # No with_structured_output().
+        #
+        # This avoids LangChain adding provider-specific
+        # structured output/tool parameters.
+        # ----------------------------------------------------
+
+        response = client.chat.completions.create(
+
+            model=OPENAI_MODEL,
+
+            temperature=OPENAI_TEMPERATURE,
+
+            messages=[
+                {
+                    "role": "system",
+                    "content":
+                        CONTACT_SYSTEM_PROMPT,
+                },
+                {
+                    "role": "user",
+                    "content":
+                        f"""
 Extract contact information from
 the following chatqna.
 
@@ -384,34 +673,88 @@ CHATQNA
 {chatqna}
 
 ========
+
+Return ONLY valid JSON.
 """,
-                ),
-            ]
+                },
+            ],
         )
+
+        # ----------------------------------------------------
+        # TIME
+        # ----------------------------------------------------
 
         elapsed = (
             time.perf_counter()
             - start_time
         )
 
+        # ----------------------------------------------------
+        # GET MODEL CONTENT
+        # ----------------------------------------------------
+
+        if not response.choices:
+
+            raise ValueError(
+                "LLM returned no choices."
+            )
+
+        message = (
+            response.choices[0].message
+        )
+
+        content = message.content
+
+        if not content:
+
+            raise ValueError(
+                "LLM returned empty content."
+            )
+
+        # ----------------------------------------------------
+        # PARSE JSON
+        # ----------------------------------------------------
+
+        raw_data = extract_json_from_response(
+            content
+        )
+
+        # ----------------------------------------------------
+        # PYDANTIC VALIDATION
+        # ----------------------------------------------------
+
+        validated = ContactExtraction.model_validate(
+            raw_data
+        )
+
+        # ----------------------------------------------------
+        # NORMALIZE CONTACTS
+        # ----------------------------------------------------
+
         contacts = []
 
         seen_types = set()
 
-        for contact_model in result.contacts:
+        for contact_model in validated.contacts:
 
             normalized = normalize_contact(
                 contact_model.model_dump()
             )
 
             if normalized is None:
+
                 continue
 
             contact_type = normalized[
                 "Type"
             ]
 
+            # ------------------------------------------------
+            # Only one HCP and one Patient
+            # ------------------------------------------------
+
             if contact_type in seen_types:
+
                 continue
 
             seen_types.add(
@@ -422,7 +765,10 @@ CHATQNA
                 normalized
             )
 
-        # Deterministic order
+        # ----------------------------------------------------
+        # DETERMINISTIC ORDER
+        # ----------------------------------------------------
+
         contacts.sort(
             key=lambda x:
             0 if x["Type"] == "HCP"
@@ -448,9 +794,11 @@ CHATQNA
         )
 
         return {
+
             "contact_result": {
                 "contacts": contacts
             },
+
             "contact_llm_time": round(
                 elapsed,
                 3
@@ -469,17 +817,11 @@ CHATQNA
         ) from exc
 
 
-
-
-
-
 # ============================================================
 # STANDALONE TEST RUNNER
 # ============================================================
 
 if __name__ == "__main__":
-
-    import json
 
     print("=" * 70)
     print("CONTACT AGENT - STANDALONE TEST")
@@ -493,7 +835,9 @@ if __name__ == "__main__":
             encoding="utf-8",
         ) as file:
 
-            input_data = json.load(file)
+            input_data = json.load(
+                file
+            )
 
         chatqna = input_data.get(
             "chatqna",
@@ -506,7 +850,10 @@ if __name__ == "__main__":
             }
         )
 
-        print("\nCONTACT AGENT OUTPUT:")
+        print(
+            "\nCONTACT AGENT OUTPUT:"
+        )
+
         print(
             json.dumps(
                 result,
@@ -514,6 +861,10 @@ if __name__ == "__main__":
                 ensure_ascii=False,
             )
         )
+
+        # ----------------------------------------------------
+        # SAVE STANDALONE OUTPUT
+        # ----------------------------------------------------
 
         with open(
             "contact_output.json",
